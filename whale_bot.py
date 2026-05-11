@@ -25,6 +25,7 @@ from collections import defaultdict, deque
 
 BOT_TOKEN = "8487052557:AAG4_lCni0grvefadbNaONgqxRjtmaum3F0"
 CHAT_ID   = "6914157653"
+
 WINDOWS = {
     "5m":  300,
     "1h":  3600,
@@ -133,14 +134,22 @@ def get_conditions(coin):
 # ══════════════════════════════════════════════
 
 def fetch_all_prices():
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=10)
-        with prices_lock:
-            for item in r.json():
-                prices[item["symbol"]] = float(item["price"])
-        print(f"[{now()}] تم تحديث {len(prices)} سعر")
-    except Exception as e:
-        print(f"[{now()}] خطأ في الأسعار: {e}")
+    for attempt in range(3):
+        try:
+            r = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=15)
+            data = r.json()
+            if not isinstance(data, list):
+                print(f"[{now()}] prices API error: {data}")
+                time.sleep(5)
+                continue
+            with prices_lock:
+                for item in data:
+                    prices[item["symbol"]] = float(item["price"])
+            print(f"[{now()}] تم تحديث {len(prices)} سعر")
+            return
+        except Exception as e:
+            print(f"[{now()}] خطأ في الأسعار (attempt {attempt+1}): {e}")
+            time.sleep(5)
 
 def price_updater():
     while True:
@@ -153,20 +162,31 @@ def price_updater():
 # ══════════════════════════════════════════════
 
 def get_all_usdt_pairs():
-    try:
-        r = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=15)
-        pairs = [
-            s["symbol"].lower()
-            for s in r.json()["symbols"]
-            if s["quoteAsset"] == "USDT"
-            and s["status"] == "TRADING"
-            and not is_stable(s["baseAsset"])
-        ]
-        print(f"[{now()}] تم جلب {len(pairs)} pair")
-        return pairs
-    except Exception as e:
-        print(f"[{now()}] خطأ في الـ pairs: {e}")
-        return []
+    for attempt in range(5):
+        try:
+            r = requests.get(
+                "https://api.binance.com/api/v3/exchangeInfo",
+                timeout=30
+            )
+            data = r.json()
+            if "symbols" not in data:
+                print(f"[{now()}] Binance API error (attempt {attempt+1}): {data}")
+                time.sleep(10)
+                continue
+            pairs = [
+                s["symbol"].lower()
+                for s in data["symbols"]
+                if s["quoteAsset"] == "USDT"
+                and s["status"] == "TRADING"
+                and not is_stable(s["baseAsset"])
+            ]
+            print(f"[{now()}] تم جلب {len(pairs)} pair")
+            return pairs
+        except Exception as e:
+            print(f"[{now()}] خطأ في الـ pairs (attempt {attempt+1}): {e}")
+            time.sleep(10)
+    print(f"[{now()}] فشل جلب الـ pairs بعد 5 محاولات")
+    return []
 
 
 # ══════════════════════════════════════════════
@@ -193,8 +213,8 @@ def send_telegram(msg: str):
 # ══════════════════════════════════════════════
 
 def calc_window(symbol: str, seconds: int) -> dict:
-    now_ts = ts()
-    start  = now_ts - seconds
+    now_ts   = ts()
+    start    = now_ts - seconds
 
     with trade_log_lock:
         trades = list(trade_log[symbol])
@@ -208,16 +228,17 @@ def calc_window(symbol: str, seconds: int) -> dict:
     pct_buy   = (buy_usd / total * 100) if total > 0 else 0
     pct_sell  = 100 - pct_buy
 
-    with first_trade_lock:
-        first = first_trade_ts.get(symbol, now_ts)
-    data_age   = now_ts - first
-    has_enough = data_age >= seconds
+    # بيحسب من وقت بداية البوت — مش من أول صفقة للعملة
+    bot_age      = now_ts - bot_start_ts
+    has_enough   = bot_age >= seconds
+    remaining_m  = max(0, int((seconds - bot_age) / 60))
 
     return {
         "buy": buy_usd, "sell": sell_usd,
         "buy_count": buy_count,
         "pct_buy": pct_buy, "pct_sell": pct_sell,
         "has_enough": has_enough,
+        "remaining_m": remaining_m,
         "data_age_min": int(data_age / 60),
     }
 
