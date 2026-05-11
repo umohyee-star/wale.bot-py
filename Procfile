@@ -1,1 +1,1 @@
-worker: python whale_bot.py
+worker: python whale_tracker_binance.py
