@@ -1,17 +1,13 @@
 """
-🐋 Binance Whale Tracker — النسخة الاحترافية
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- يراقب كل العملات على Binance عبر WebSocket
-- تنبيه فوري لصفقات الحيتان
-- كشف تراكم الشراء (Pump Detection)
-- إحصائيات آخر ساعة / 4 ساعات / 24 ساعة
-- أوامر VIP من Telegram
+🐋 Binance Whale Tracker v4
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+- يبعت تنبيه لو اتحققت أي شروط متوفرة
+- يوضح الشروط اللي اتحققت والناقصة
+- يتجاهل كل الـ stablecoins
+- كل فريم مستقل تماماً
 
 التثبيت:
     pip install websocket-client requests
-
-الإعداد:
-    غيّر BOT_TOKEN و CHAT_ID بالقيم بتاعتك
 """
 
 import json
@@ -26,51 +22,100 @@ from collections import defaultdict, deque
 # ══════════════════════════════════════════════
 #  ⚙️  الإعدادات
 # ══════════════════════════════════════════════
+
 BOT_TOKEN = "8487052557:AAG4_lCni0grvefadbNaONgqxRjtmaum3F0"
 CHAT_ID   = "6914157653"
-MIN_USD     = 20_000
-VIP_MIN_USD = 20_000
-
-# حدود التراكم حسب حجم العملة
-PUMP_WINDOW_SEC = 300   # 5 دقائق
-
-BIG_COINS    = {"BTC", "ETH"}
-MID_COINS    = {"SOL", "BNB", "XRP", "ADA", "AVAX", "DOT", "LINK", "LTC", "TRX"}
-
-PUMP_LIMIT_BIG  = 500_000   # BTC / ETH
-PUMP_LIMIT_MID  = 100_000   # عملات متوسطة
-PUMP_LIMIT_SMALL = 30_000   # عملات صغيرة
-
-# العملات الثابتة
-STABLE_PAIRS = {
-    "USDCUSDT", "BUSDUSDT", "TUSDUSDT", "USDPUSDT",
-    "FDUSDUSDT", "DAIUSDT", "EURUSDT", "USDTUSDT"
+WINDOWS = {
+    "5m":  300,
+    "1h":  3600,
+    "4h":  14400,
+    "24h": 86400,
 }
+
+CONDITIONS = {
+    "BTC": {
+        "5m":   50_000_000,
+        "1h":  150_000_000,
+        "4h":  200_000_000,
+        "24h": 500_000_000,
+    },
+    "ETH": {
+        "5m":   20_000_000,
+        "1h":   80_000_000,
+        "4h":  150_000_000,
+        "24h": 300_000_000,
+    },
+    "SOL": {
+        "5m":     100_000,
+        "1h":     500_000,
+        "4h":   2_000_000,
+        "24h": 10_000_000,
+    },
+    "BNB": {
+        "5m":     100_000,
+        "1h":     500_000,
+        "4h":   2_000_000,
+        "24h": 10_000_000,
+    },
+    "XRP": {
+        "5m":     100_000,
+        "1h":     500_000,
+        "4h":   2_000_000,
+        "24h": 10_000_000,
+    },
+    "DEFAULT": {
+        "5m":   20_000,
+        "1h":   60_000,
+        "4h":  150_000,
+        "24h": 300_000,
+    },
+}
+
+# لازم على الأقل شرطين يتحققوا عشان يبعت تنبيه
+MIN_CONDITIONS_MET = 2
+
+PUMP_COOLDOWN = 600
+VIP_MIN_USD   = 5_000
+
+# كل العملات الثابتة والمستقرة
+STABLE_COINS = {
+    "USDC", "BUSD", "TUSD", "USDP", "FDUSD",
+    "DAI", "USDD", "USDJ", "USDX", "USDT1",
+    "EUR", "GBP", "AUD", "AEUR", "BEUR",
+    "PAXG", "XAUT",
+}
+
+def is_stable(coin: str) -> bool:
+    return coin in STABLE_COINS or coin.startswith("USD") or coin.endswith("USD")
+
 
 # ══════════════════════════════════════════════
 #  بيانات مشتركة
 # ══════════════════════════════════════════════
 
-prices      = {}
-prices_lock = threading.Lock()
+prices           = {}
+prices_lock      = threading.Lock()
 
-vip_coins = set()
-vip_lock  = threading.Lock()
+vip_coins        = set()
+vip_lock         = threading.Lock()
 
-alert_count = 0
-alert_lock  = threading.Lock()
+alert_count      = 0
+alert_lock       = threading.Lock()
 
-# سجل الصفقات لكل عملة — deque of (timestamp, side, usd_value)
-trade_log      = defaultdict(lambda: deque())
-trade_log_lock = threading.Lock()
+trade_log        = defaultdict(deque)
+trade_log_lock   = threading.Lock()
 
-# منع تنبيه Pump المكرر — آخر وقت تنبيه لكل عملة
-last_pump_alert = {}
-pump_alert_lock = threading.Lock()
+first_trade_ts   = {}
+first_trade_lock = threading.Lock()
+
+last_pump_alert  = {}
+pump_alert_lock  = threading.Lock()
+
+bot_start_ts     = time.time()
 
 
 # ══════════════════════════════════════════════
-#  وقت
+#  مساعدات
 # ══════════════════════════════════════════════
 
 def now():
@@ -78,6 +123,9 @@ def now():
 
 def ts():
     return time.time()
+
+def get_conditions(coin):
+    return CONDITIONS.get(coin, CONDITIONS["DEFAULT"])
 
 
 # ══════════════════════════════════════════════
@@ -87,13 +135,12 @@ def ts():
 def fetch_all_prices():
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=10)
-        data = r.json()
         with prices_lock:
-            for item in data:
+            for item in r.json():
                 prices[item["symbol"]] = float(item["price"])
         print(f"[{now()}] تم تحديث {len(prices)} سعر")
     except Exception as e:
-        print(f"[{now()}] خطأ في جلب الأسعار: {e}")
+        print(f"[{now()}] خطأ في الأسعار: {e}")
 
 def price_updater():
     while True:
@@ -108,16 +155,17 @@ def price_updater():
 def get_all_usdt_pairs():
     try:
         r = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=15)
-        data = r.json()
         pairs = [
             s["symbol"].lower()
-            for s in data["symbols"]
-            if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
+            for s in r.json()["symbols"]
+            if s["quoteAsset"] == "USDT"
+            and s["status"] == "TRADING"
+            and not is_stable(s["baseAsset"])
         ]
-        print(f"[{now()}] تم جلب {len(pairs)} pair من Binance")
+        print(f"[{now()}] تم جلب {len(pairs)} pair")
         return pairs
     except Exception as e:
-        print(f"[{now()}] خطأ في جلب الـ pairs: {e}")
+        print(f"[{now()}] خطأ في الـ pairs: {e}")
         return []
 
 
@@ -127,14 +175,13 @@ def get_all_usdt_pairs():
 
 def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }, timeout=10)
         if r.status_code != 200:
             print(f"[{now()}] Telegram error: {r.text}")
     except Exception as e:
@@ -142,139 +189,141 @@ def send_telegram(msg: str):
 
 
 # ══════════════════════════════════════════════
-#  إحصائيات العملة
+#  حساب فريم زمني مستقل
 # ══════════════════════════════════════════════
 
-def get_coin_stats(coin: str) -> dict:
-    symbol = coin + "USDT"
+def calc_window(symbol: str, seconds: int) -> dict:
     now_ts = ts()
-    windows = {
-        "1h":  3600,
-        "4h":  14400,
-        "24h": 86400,
+    start  = now_ts - seconds
+
+    with trade_log_lock:
+        trades = list(trade_log[symbol])
+
+    window_trades = [t for t in trades if t[0] >= start]
+
+    buy_usd   = sum(t[2] for t in window_trades if t[1] == "BUY")
+    sell_usd  = sum(t[2] for t in window_trades if t[1] == "SELL")
+    buy_count = sum(1 for t in window_trades if t[1] == "BUY")
+    total     = buy_usd + sell_usd
+    pct_buy   = (buy_usd / total * 100) if total > 0 else 0
+    pct_sell  = 100 - pct_buy
+
+    with first_trade_lock:
+        first = first_trade_ts.get(symbol, now_ts)
+    data_age   = now_ts - first
+    has_enough = data_age >= seconds
+
+    return {
+        "buy": buy_usd, "sell": sell_usd,
+        "buy_count": buy_count,
+        "pct_buy": pct_buy, "pct_sell": pct_sell,
+        "has_enough": has_enough,
+        "data_age_min": int(data_age / 60),
     }
-    result = {}
-    with trade_log_lock:
-        trades = list(trade_log[symbol])
 
-    for label, secs in windows.items():
-        cutoff = now_ts - secs
-        buy_usd  = sum(t[2] for t in trades if t[0] >= cutoff and t[1] == "BUY")
-        sell_usd = sum(t[2] for t in trades if t[0] >= cutoff and t[1] == "SELL")
-        total    = buy_usd + sell_usd
-        result[label] = {
-            "buy":  buy_usd,
-            "sell": sell_usd,
-            "pct":  (buy_usd / total * 100) if total > 0 else 50,
-        }
-    return result
+def sentiment(pct_buy):
+    if pct_buy >= 70: return "🚀 ضغط شراء قوي جداً"
+    if pct_buy >= 60: return "📈 ضغط شراء"
+    if pct_buy >= 50: return "↗️ ميل للشراء"
+    if pct_buy <= 30: return "🔴 ضغط بيع قوي"
+    if pct_buy <= 40: return "📉 ميل للبيع"
+    return "⚖️ محايد"
 
-
-def format_stats(coin: str) -> str:
-    stats = get_coin_stats(coin)
-    with prices_lock:
-        price = prices.get(coin + "USDT", 0)
-
-    lines = [f"📊 <b>{coin}/USDT</b>  💵 ${price:,.6f}\n━━━━━━━━━━━━━━━━━━"]
-    labels = {"1h": "آخر ساعة", "4h": "آخر 4 ساعات", "24h": "آخر 24 ساعة"}
-
-    for key, label in labels.items():
-        d = stats[key]
-        pct = d["pct"]
-        if pct >= 65:
-            sentiment = "🚀 ضغط شراء قوي"
-        elif pct >= 55:
-            sentiment = "📈 ميل للشراء"
-        elif pct <= 35:
-            sentiment = "🔴 ضغط بيع قوي"
-        elif pct <= 45:
-            sentiment = "📉 ميل للبيع"
-        else:
-            sentiment = "⚖️ محايد"
-
-        lines.append(
-            f"\n⏱ <b>{label}</b>\n"
-            f"  🟢 شراء: ${d['buy']:>12,.0f}\n"
-            f"  🔴 بيع:  ${d['sell']:>12,.0f}\n"
-            f"  {sentiment} ({pct:.0f}% شراء)"
+def fmt_window(label, d, cond_val):
+    if not d["has_enough"]:
+        return (
+            f"⏱ <b>{label}</b>\n"
+            f"  ⏳ جاري جمع البيانات ({d['data_age_min']} دقيقة)\n"
+            f"  📋 الشرط: ${cond_val:,.0f}"
         )
-
-    return "\n".join(lines)
+    met = "✅" if d["buy"] >= cond_val else "❌"
+    return (
+        f"⏱ <b>{label}</b>  {met}\n"
+        f"  🟢 شراء: ${d['buy']:>14,.0f}  ({d['pct_buy']:.1f}%)\n"
+        f"  🔴 بيع:  ${d['sell']:>14,.0f}  ({d['pct_sell']:.1f}%)\n"
+        f"  {sentiment(d['pct_buy'])}\n"
+        f"  📋 الشرط: ${cond_val:,.0f}"
+    )
 
 
 # ══════════════════════════════════════════════
-#  كشف التراكم (Pump Detection)
+#  فحص الشروط وإرسال التنبيه
 # ══════════════════════════════════════════════
 
-def get_pump_limit(coin: str) -> float:
-    if coin in BIG_COINS:
-        return PUMP_LIMIT_BIG
-    elif coin in MID_COINS:
-        return PUMP_LIMIT_MID
-    else:
-        return PUMP_LIMIT_SMALL
-
-
-def check_pump(coin: str, symbol: str):
+def check_conditions(coin: str, symbol: str):
     now_ts = ts()
-    cutoff  = now_ts - PUMP_WINDOW_SEC
 
-    with trade_log_lock:
-        trades = list(trade_log[symbol])
+    with pump_alert_lock:
+        if now_ts - last_pump_alert.get(coin, 0) < PUMP_COOLDOWN:
+            return
 
-    buy_usd   = sum(t[2] for t in trades if t[0] >= cutoff and t[1] == "BUY")
-    sell_usd  = sum(t[2] for t in trades if t[0] >= cutoff and t[1] == "SELL")
-    buy_count = sum(1 for t in trades if t[0] >= cutoff and t[1] == "BUY")
-    limit     = get_pump_limit(coin)
+    cond = get_conditions(coin)
 
-    if buy_usd < limit:
+    d5m  = calc_window(symbol, WINDOWS["5m"])
+    d1h  = calc_window(symbol, WINDOWS["1h"])
+    d4h  = calc_window(symbol, WINDOWS["4h"])
+    d24h = calc_window(symbol, WINDOWS["24h"])
+
+    windows_data = [
+        ("5m",  d5m,  cond["5m"],  "آخر 5 دقائق"),
+        ("1h",  d1h,  cond["1h"],  "آخر ساعة"),
+        ("4h",  d4h,  cond["4h"],  "آخر 4 ساعات"),
+        ("24h", d24h, cond["24h"], "آخر 24 ساعة"),
+    ]
+
+    # عدّ الشروط المتحققة (بيانات كافية + تجاوز الحد)
+    met_count = sum(
+        1 for _, d, c, _ in windows_data
+        if d["has_enough"] and d["buy"] >= c
+    )
+
+    # لازم على الأقل MIN_CONDITIONS_MET شروط تتحقق
+    if met_count < MIN_CONDITIONS_MET:
         return
 
-    # منع تكرار التنبيه في 10 دقائق
     with pump_alert_lock:
-        last = last_pump_alert.get(coin, 0)
-        if now_ts - last < 600:
-            return
         last_pump_alert[coin] = now_ts
 
     with prices_lock:
         price = prices.get(symbol, 0)
 
-    msg = (
-        f"🚨 <b>تراكم شراء مشبوه!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 <b>{coin}/USDT</b>\n"
-        f"💰 إجمالي الشراء: <b>${buy_usd:,.0f}</b>\n"
-        f"🔴 إجمالي البيع:  ${sell_usd:,.0f}\n"
-        f"📊 عدد الصفقات: {buy_count}\n"
-        f"⏱ خلال: 5 دقائق\n"
-        f"💵 السعر الحالي: ${price:,.6f}\n"
-        f"🔗 <a href='https://www.binance.com/en/trade/{coin}_USDT'>افتح الشارت</a>"
-    )
+    # اعمل الرسالة
+    lines = [
+        f"🚨 <b>تراكم شراء — {coin}/USDT</b>",
+        f"✅ شروط محققة: {met_count}/4",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+
+    for _, d, c, label in windows_data:
+        lines.append(fmt_window(label, d, c))
+        lines.append("")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        f"📊 صفقات شراء (5د): {d5m['buy_count']}",
+        f"💵 السعر: ${price:,.6f}",
+        f"🔗 <a href='https://www.binance.com/en/trade/{coin}_USDT'>افتح الشارت</a>",
+    ]
+
+    msg = "\n".join(lines)
     threading.Thread(target=send_telegram, args=(msg,), daemon=True).start()
-    print(f"[{now()}] 🚨 PUMP DETECTED: {coin} buy=${buy_usd:,.0f}")
+    print(f"[{now()}] 🚨 {coin} | {met_count}/4 شروط | 5m=${d5m['buy']:,.0f}")
 
 
 # ══════════════════════════════════════════════
-#  تنسيق تنبيه الصفقة
+#  تنبيه VIP
 # ══════════════════════════════════════════════
 
-def format_alert(symbol, side, qty, price, usd_value, is_vip=False):
-    coin   = symbol.replace("USDT", "").upper()
+def format_vip_alert(symbol, side, qty, price, usd_value):
+    coin   = symbol.replace("USDT", "")
     emoji  = "🟢" if side == "BUY" else "🔴"
     action = "شراء" if side == "BUY" else "بيع"
-
-    if is_vip:
-        tag = "⭐️ <b>VIP</b>\n"
-    elif usd_value >= 1_000_000:
-        tag = "🐋 <b>MEGA WHALE</b>\n"
-    elif usd_value >= 500_000:
-        tag = "🦈 <b>BIG WHALE</b>\n"
-    else:
-        tag = ""
-
+    tag    = (
+        "🐋 <b>MEGA WHALE</b>\n" if usd_value >= 1_000_000 else
+        "🦈 <b>BIG WHALE</b>\n"  if usd_value >= 500_000   else ""
+    )
     return (
-        f"{tag}"
+        f"⭐️ <b>VIP</b>  {tag}"
         f"{emoji} <b>{action} — {coin}/USDT</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💰 القيمة:  <b>${usd_value:,.0f}</b>\n"
@@ -299,44 +348,43 @@ def on_message(ws, message):
             return
 
         symbol = data["s"]
-        if symbol in STABLE_PAIRS:
+        coin   = symbol.replace("USDT", "")
+
+        if is_stable(coin):
             return
 
         price     = float(data["p"])
         qty       = float(data["q"])
         side      = "SELL" if data["m"] else "BUY"
         usd_value = qty * price
-        coin      = symbol.replace("USDT", "")
+        now_ts    = ts()
 
-        # سجّل الصفقة للإحصائيات والـ pump detection
+        # سجّل الصفقة
         with trade_log_lock:
-            trade_log[symbol].append((ts(), side, usd_value))
-            # امسح القديم (أكتر من 24 ساعة)
-            cutoff = ts() - 86400
+            trade_log[symbol].append((now_ts, side, usd_value))
+            cutoff = now_ts - 86400
             while trade_log[symbol] and trade_log[symbol][0][0] < cutoff:
                 trade_log[symbol].popleft()
 
-        # فحص pump
-        if side == "BUY":
-            threading.Thread(target=check_pump, args=(coin, symbol), daemon=True).start()
+        # سجّل أول صفقة
+        with first_trade_lock:
+            if symbol not in first_trade_ts:
+                first_trade_ts[symbol] = now_ts
 
-        # تحقق VIP
+        # فحص الشروط
+        if side == "BUY":
+            threading.Thread(
+                target=check_conditions, args=(coin, symbol), daemon=True
+            ).start()
+
+        # تنبيه VIP
         with vip_lock:
             is_vip = coin in vip_coins
-
-        if not is_vip and usd_value < MIN_USD:
-            return
-        if is_vip and usd_value < VIP_MIN_USD:
-            return
-
-        with alert_lock:
-            alert_count += 1
-            count = alert_count
-
-        print(f"[{now()}] #{count} {'⭐' if is_vip else ''}{side:4s} {coin:10s} ${usd_value:>12,.0f}")
-
-        msg = format_alert(symbol, side, qty, price, usd_value, is_vip)
-        threading.Thread(target=send_telegram, args=(msg,), daemon=True).start()
+        if is_vip and usd_value >= VIP_MIN_USD:
+            with alert_lock:
+                alert_count += 1
+            msg = format_vip_alert(symbol, side, qty, price, usd_value)
+            threading.Thread(target=send_telegram, args=(msg,), daemon=True).start()
 
     except Exception as e:
         print(f"[{now()}] on_message error: {e}")
@@ -361,7 +409,11 @@ def handle_commands():
     while True:
         try:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-            r = requests.get(url, params={"offset": last_update_id + 1, "timeout": 30}, timeout=35)
+            r = requests.get(
+                url,
+                params={"offset": last_update_id + 1, "timeout": 30},
+                timeout=35
+            )
             updates = r.json().get("result", [])
 
             for update in updates:
@@ -369,11 +421,9 @@ def handle_commands():
                 msg     = update.get("message", {})
                 text    = msg.get("text", "").strip()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
-
                 if chat_id != str(CHAT_ID):
                     continue
 
-                # /vip_add
                 if text.startswith("/vip_add"):
                     parts = text.split()
                     if len(parts) < 2:
@@ -384,7 +434,6 @@ def handle_commands():
                         vip_coins.add(coin)
                     send_telegram(f"⭐️ تم إضافة <b>{coin}</b> للـ VIP")
 
-                # /vip_remove
                 elif text.startswith("/vip_remove"):
                     parts = text.split()
                     if len(parts) < 2:
@@ -395,26 +444,39 @@ def handle_commands():
                         vip_coins.discard(coin)
                     send_telegram(f"🗑 تم إزالة <b>{coin}</b> من VIP")
 
-                # /vip_list
                 elif text == "/vip_list":
                     with vip_lock:
                         coins = sorted(vip_coins)
-                    if coins:
-                        send_telegram("⭐️ <b>عملات VIP:</b>\n" + "\n".join(f"• {c}" for c in coins))
-                    else:
-                        send_telegram("📭 مفيش عملات VIP")
+                    send_telegram(
+                        "⭐️ <b>عملات VIP:</b>\n" + "\n".join(f"• {c}" for c in coins)
+                        if coins else "📭 مفيش عملات VIP"
+                    )
 
-                # /stats
                 elif text.startswith("/stats"):
                     parts = text.split()
                     if len(parts) < 2:
                         send_telegram("❌ مثال: /stats BTC")
                         continue
-                    coin = parts[1].upper().replace("USDT", "")
-                    send_telegram(format_stats(coin))
+                    coin   = parts[1].upper().replace("USDT", "")
+                    symbol = coin + "USDT"
+                    cond   = get_conditions(coin)
+                    with prices_lock:
+                        price = prices.get(symbol, 0)
+                    d5m  = calc_window(symbol, WINDOWS["5m"])
+                    d1h  = calc_window(symbol, WINDOWS["1h"])
+                    d4h  = calc_window(symbol, WINDOWS["4h"])
+                    d24h = calc_window(symbol, WINDOWS["24h"])
+                    send_telegram(
+                        f"📊 <b>{coin}/USDT</b>  💵 ${price:,.6f}\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"{fmt_window('آخر 5 دقائق', d5m, cond['5m'])}\n\n"
+                        f"{fmt_window('آخر ساعة', d1h, cond['1h'])}\n\n"
+                        f"{fmt_window('آخر 4 ساعات', d4h, cond['4h'])}\n\n"
+                        f"{fmt_window('آخر 24 ساعة', d24h, cond['24h'])}"
+                    )
 
-                # /status
                 elif text == "/status":
+                    uptime = int((ts() - bot_start_ts) / 60)
                     with vip_lock:
                         vip = sorted(vip_coins)
                     with alert_lock:
@@ -422,12 +484,13 @@ def handle_commands():
                     send_telegram(
                         f"✅ <b>البوت شغال</b>\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
-                        f"📊 تنبيهات: <b>{count}</b>\n"
+                        f"⏱ وقت التشغيل: {uptime} دقيقة\n"
+                        f"📊 تنبيهات VIP: <b>{count}</b>\n"
                         f"⭐️ VIP: {', '.join(vip) if vip else 'لا يوجد'}\n"
-                        f"💰 الحد الأدنى: ${MIN_USD:,}"
+                        f"🚨 Pump Detection: ✅\n"
+                        f"📋 الحد الأدنى للتنبيه: {MIN_CONDITIONS_MET}/4 شروط"
                     )
 
-                # /help
                 elif text == "/help":
                     send_telegram(
                         "🐋 <b>أوامر البوت:</b>\n"
@@ -446,7 +509,7 @@ def handle_commands():
 
 
 # ══════════════════════════════════════════════
-#  تقسيم الـ Pairs
+#  WebSocket connections
 # ══════════════════════════════════════════════
 
 def chunk_list(lst, n):
@@ -476,12 +539,12 @@ def run_websocket(pairs_chunk, index):
 # ══════════════════════════════════════════════
 
 def check_telegram():
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=10
+        )
         if r.status_code == 200:
-            name = r.json()["result"]["username"]
-            print(f"[{now()}] Telegram Bot: @{name}")
+            print(f"[{now()}] Telegram: @{r.json()['result']['username']}")
             return True
         print(f"[{now()}] Telegram Token غلط")
         return False
@@ -496,21 +559,19 @@ def check_telegram():
 
 def main():
     print("=" * 55)
-    print("  🐋 Binance Whale Tracker — النسخة الاحترافية")
-    print(f"  الحد الأدنى: ${MIN_USD:,}")
+    print("  🐋 Binance Whale Tracker v4")
+    print(f"  يبعت لو اتحققت {MIN_CONDITIONS_MET}/4 شروط على الأقل")
     print("=" * 55)
 
     if not check_telegram():
-        print("تأكد من BOT_TOKEN و CHAT_ID وأعد التشغيل")
+        print("تأكد من BOT_TOKEN و CHAT_ID")
         return
 
     all_pairs = get_all_usdt_pairs()
     if not all_pairs:
-        print("مقدرش أجيب الـ pairs.")
         return
 
     fetch_all_prices()
-
     threading.Thread(target=price_updater, daemon=True).start()
     threading.Thread(target=handle_commands, daemon=True).start()
 
@@ -518,13 +579,11 @@ def main():
     print(f"[{now()}] فتح {len(chunks)} connection(s) لـ {len(all_pairs)} pair...")
 
     send_telegram(
-        "🐋 <b>Whale Tracker شغال!</b>\n"
+        "🐋 <b>Whale Tracker v4 شغال!</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 المنصة: Binance (كل العملات)\n"
-        f"🔢 عدد الـ Pairs: <b>{len(all_pairs)}</b>\n"
-        f"💰 الحد الأدنى: <b>${MIN_USD:,}</b>\n"
-        f"🚨 Pump Detection: ✅ شغال\n"
-        f"📈 إحصائيات: /stats BTC\n"
+        f"📊 Binance — {len(all_pairs)} عملة (بدون stablecoins)\n"
+        f"📋 التنبيه يجي لو {MIN_CONDITIONS_MET}/4 شروط اتحققت\n"
+        f"⏳ الفريمات الناقصة بيانات بتظهر تلقائي\n"
         f"⏰ بدأ في: {now()}"
     )
 
@@ -540,7 +599,8 @@ def main():
     try:
         while True:
             time.sleep(60)
-            print(f"[{now()}] alive | تنبيهات: {alert_count} | pairs: {len(all_pairs)}")
+            uptime = int((ts() - bot_start_ts) / 60)
+            print(f"[{now()}] alive | uptime: {uptime}m | pairs: {len(all_pairs)}")
     except KeyboardInterrupt:
         print(f"\n[{now()}] تم إيقاف البوت.")
 
